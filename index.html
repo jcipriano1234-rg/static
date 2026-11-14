@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enhance — cinematic video, right in your browser</title>
+<meta name="description" content="Give any video the cinematic look — rich color, deep blacks, maximum sharpness. Runs 100% in your browser. Nothing is uploaded.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+  <div class="brand">Enhance</div>
+  <span class="engine-mode" id="engineMode"></span>
+</nav>
+
+<main>
+  <section class="hero">
+    <div class="badge">Runs 100% in your browser · nothing is uploaded</div>
+    <h1>Turn any video<br><span class="grad">cinematic.</span></h1>
+    <p>Pro color grade · deep blacks · rich color · maximum sharpness.<br>
+       The whole engine runs on your device — your video never touches a server.</p>
+  </section>
+
+  <section class="card" id="appCard">
+    <div class="drop" id="drop" tabindex="0">
+      <input type="file" id="file" accept="video/*" hidden>
+      <div class="drop-ic">🎬</div>
+      <div class="drop-t">Drop a video here</div>
+      <div class="drop-s">or click to choose · MP4, MOV, WebM</div>
+    </div>
+
+    <div class="chip hidden" id="chip">
+      <div class="chip-info">
+        <div class="chip-name" id="chipName"></div>
+        <div class="chip-meta" id="chipMeta"></div>
+        <div class="chip-warn hidden" id="chipWarn">Long clip — only the first 90 seconds will be enhanced (browser memory limit).</div>
+      </div>
+      <button class="x" id="clearBtn" title="Choose another video">✕</button>
+    </div>
+
+    <button class="btn hidden" id="goBtn">Enhance video</button>
+
+    <div class="prog hidden" id="progWrap">
+      <div class="prog-bar"><div class="prog-fill" id="progFill"></div></div>
+      <div class="prog-label" id="progLabel"></div>
+    </div>
+
+    <div class="status hidden" id="status"></div>
+    <details class="logs hidden" id="logsWrap"><summary>Technical details</summary><pre id="logs"></pre></details>
+
+    <div class="result hidden" id="result">
+      <h2>Done — compare &amp; download</h2>
+      <div class="cmp" id="cmp">
+        <img id="imgBefore" alt="Before">
+        <div class="cmp-after" id="cmpAfter"><img id="imgAfter" alt="After"></div>
+        <input type="range" id="cmpSlider" min="0" max="100" value="50">
+        <span class="cmp-tag l">Before</span>
+        <span class="cmp-tag r">After</span>
+      </div>
+      <video id="outVid" controls playsinline></video>
+      <a class="btn dl" id="dlBtn" download>Download enhanced video</a>
+      <button class="ghost" id="againBtn">Enhance another video</button>
+    </div>
+  </section>
+
+  <p class="fine" id="fine">Tip: short clips work best — phones may need several minutes. Keep this tab open while it runs.</p>
+  <a class="join hidden" id="joinLink" target="_blank" rel="noopener">Join the Enhance community — updates &amp; support →</a>
+</main>
+
+<footer>Enhance — private by design. Your video never leaves your device.</footer>
+
+<script src="vendor/ffmpeg.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const u = p => new URL(p, location.href).href;
+const ISOLATED = self.crossOriginIsolated;
+const MAX_SECONDS = 90;
+const WHOP_JOIN_URL = "";
+
+const drop = $("drop"), fileIn = $("file"), chip = $("chip"), chipName = $("chipName"),
+      chipMeta = $("chipMeta"), chipWarn = $("chipWarn"), goBtn = $("goBtn"),
+      progWrap = $("progWrap"), progFill = $("progFill"), progLabel = $("progLabel"),
+      status = $("status"), logsWrap = $("logsWrap"), logsEl = $("logs"), result = $("result");
+
+let curPct = 0;
+let ffmpeg = null, loaded = false, file = null, meta = null;
+let encoding = false, logs = [];
+let urlOut = null, urlBefore = null, urlAfter = null, blobOut = null;
+
+$("engineMode").textContent = ISOLATED ? "Engine: multi-thread (fast)" : "Engine: single-thread (slower — open this page in its own tab for full speed)";
+if (WHOP_JOIN_URL) {
+  const j = $("joinLink");
+  j.href = WHOP_JOIN_URL;
+  j.classList.remove("hidden");
+}
+if (navigator.maxTouchPoints > 1 && Math.min(screen.width, screen.height) < 500)
+  $("fine").textContent = "Phone mode: only short clips (under ~30 s) are realistic here. A computer handles longer ones.";
+
+function setBar(pct, label) {
+  curPct = pct;
+  progWrap.classList.remove("hidden");
+  progFill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+  progLabel.textContent = label;
+}
+
+function showStatus(msg, isErr) {
+  status.classList.remove("hidden");
+  status.textContent = msg;
+  status.classList.toggle("err", !!isErr);
+  if (isErr && logs.length) {
+    logsWrap.classList.remove("hidden");
+    logsEl.textContent = logs.slice(-40).join("\n");
+  }
+}
+
+drop.addEventListener("click", () => fileIn.click());
+drop.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") fileIn.click(); });
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", e => {
+  e.preventDefault();
+  drop.classList.remove("over");
+  if (e.dataTransfer.files.length) pick(e.dataTransfer.files[0]);
+});
+fileIn.addEventListener("change", () => { if (fileIn.files.length) pick(fileIn.files[0]); });
+$("clearBtn").addEventListener("click", reset);
+$("againBtn").addEventListener("click", () => location.reload());
+goBtn.addEventListener("click", run);
+
+function pick(f) {
+  if (!f.type.startsWith("video/") && !/\.(mp4|mov|webm|mkv|avi|m4v)$/i.test(f.name)) {
+    showStatus("That's not a video file.", true);
+    return;
+  }
+  file = f;
+  const v = document.createElement("video");
+  v.preload = "metadata";
+  v.onloadedmetadata = () => {
+    meta = { dur: v.duration, w: v.videoWidth, h: v.videoHeight };
+    URL.revokeObjectURL(v.src);
+    chip.classList.remove("hidden");
+    drop.classList.add("hidden");
+    goBtn.classList.remove("hidden");
+    status.classList.add("hidden");
+    chipName.textContent = f.name;
+    chipMeta.textContent = (meta.w || "?") + "×" + (meta.h || "?") + " · " + meta.dur.toFixed(1) + " s · " + (f.size / 1048576).toFixed(1) + " MB";
+    chipWarn.classList.toggle("hidden", meta.dur <= MAX_SECONDS);
+  };
+  v.onerror = () => { URL.revokeObjectURL(v.src); showStatus("Couldn't read that file — try a different format.", true); };
+  v.src = URL.createObjectURL(f);
+}
+
+function reset() {
+  file = null; meta = null;
+  chip.classList.add("hidden");
+  goBtn.classList.add("hidden");
+  drop.classList.remove("hidden");
+  status.classList.add("hidden");
+  logsWrap.classList.add("hidden");
+  fileIn.value = "";
+}
+
+async function ensureLoaded() {
+  if (loaded) return;
+  const { FFmpeg } = FFmpegWASM;
+  ffmpeg = new FFmpeg();
+  ffmpeg.on("log", ({ message }) => { logs.push(message); if (logs.length > 80) logs.shift(); });
+  ffmpeg.on("progress", ({ progress }) => {
+    if (encoding && progress >= 0 && progress <= 1)
+      setBar(35 + progress * 55, "Enhancing… " + Math.round(progress * 100) + "% — keep this tab open");
+  });
+  setBar(4, "Loading engine… (first time only)");
+  const tick = setInterval(() => setBar(Math.min(18, curPct + 2), "Loading engine… (first time only)"), 900);
+  try {
+    if (ISOLATED) {
+      await ffmpeg.load({
+        coreURL: u("vendor/ffmpeg-core-mt.js"),
+        wasmURL: u("vendor/ffmpeg-core-mt.wasm"),
+        workerURL: u("vendor/ffmpeg-core-mt.worker.js")
+      });
+    } else {
+      await ffmpeg.load({
+        coreURL: u("vendor/ffmpeg-core-st.js"),
+        wasmURL: u("vendor/ffmpeg-core-st.wasm")
+      });
+    }
+    loaded = true;
+    setBar(20, "Engine ready");
+  } finally {
+    clearInterval(tick);
+  }
+}
+
+async function exec(args, pct, label) {
+  setBar(pct, label);
+  const rc = await ffmpeg.exec(args);
+  if (rc !== 0) throw new Error("ffmpeg exit code " + rc);
+}
+
+function vfChain(hasLut) {
+  const c = ["hqdn3d=2:2:4:4"];
+  if (hasLut) {
+    c.push("lut3d=file=lut.cube", "cas=0.55");
+  } else {
+    c.push(
+      "unsharp=lx=21:ly=3:la=0.6",
+      "unsharp=lx=3:ly=21:la=0.6",
+      "cas=0.6",
+      "eq=contrast=1.18:saturation=1.35:gamma=0.97",
+      "colorbalance=rs=0.03:rm=0.05:bs=-0.03:bm=-0.05"
+    );
+  }
+  c.push("scale=-2:min(1080,ih)", "format=yuv420p");
+  return c.join(",");
+}
+
+async function run() {
+  if (!file || !meta) return;
+  goBtn.disabled = true;
+  drop.classList.add("hidden");
+  chip.classList.add("hidden");
+  logs = [];
+  try {
+    await ensureLoaded();
+
+    let hasLut = false;
+    try {
+      const r = await fetch(u("lut.cube"));
+      if (r.ok) {
+        await ffmpeg.writeFile("lut.cube", new Uint8Array(await r.arrayBuffer()));
+        hasLut = true;
+      }
+    } catch (e) {}
+
+    const ext = (file.name.split(".").pop() || "mp4").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const inName = "input." + (ext || "mp4");
+    await ffmpeg.writeFile(inName, new Uint8Array(await file.arrayBuffer()));
+    setBar(25, "Video loaded");
+
+    const ss = meta.dur > 1.2 ? "1" : "0";
+    await exec(["-ss", ss, "-i", inName, "-frames:v", "1", "-q:v", "2", "before.jpg"], 30, "Extracting before frame…");
+
+    encoding = true;
+    const args = ["-i", inName];
+    if (meta.dur > MAX_SECONDS) args.push("-t", String(MAX_SECONDS));
+    args.push(
+      "-vf", vfChain(hasLut),
+      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+      "-threads", String(Math.min(8, navigator.hardwareConcurrency || 4)),
+      "-c:a", "aac", "-b:a", "128k",
+      "-movflags", "+faststart",
+      "out.mp4"
+    );
+    await exec(args, 35, "Enhancing… 0% — keep this tab open");
+    encoding = false;
+
+    await exec(["-ss", ss, "-i", "out.mp4", "-frames:v", "1", "-q:v", "2", "after.jpg"], 93, "Extracting after frame…");
+
+    const data = await ffmpeg.readFile("out.mp4");
+    const bj = await ffmpeg.readFile("before.jpg");
+    const aj = await ffmpeg.readFile("after.jpg");
+    blobOut = new Blob([data], { type: "video/mp4" });
+    urlOut = URL.createObjectURL(blobOut);
+    urlBefore = URL.createObjectURL(new Blob([bj], { type: "image/jpeg" }));
+    urlAfter = URL.createObjectURL(new Blob([aj], { type: "image/jpeg" }));
+
+    $("outVid").src = urlOut;
+    $("imgBefore").src = urlBefore;
+    $("imgAfter").src = urlAfter;
+    const base = file.name.replace(/\.[^.]+$/, "");
+    $("dlBtn").href = urlOut;
+    $("dlBtn").download = "enhanced_" + base + ".mp4";
+
+    setBar(100, "Done");
+    progWrap.classList.add("hidden");
+    result.classList.remove("hidden");
+    result.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (err) {
+    encoding = false;
+    let msg = "Something went wrong: " + err.message;
+    if (/abort|OOM|memory|alloc/i.test(err.message || ""))
+      msg = "This clip is too big for your browser's memory. Try a shorter one (" + MAX_SECONDS + " s max recommended).";
+    showStatus(msg, true);
+    goBtn.disabled = false;
+  }
+}
+
+const cmp = $("cmp"), cmpAfter = $("cmpAfter"), cmpSlider = $("cmpSlider");
+cmpSlider.addEventListener("input", () => { cmpAfter.style.width = cmpSlider.value + "%"; });
+</script>
+</body>
+</html>
